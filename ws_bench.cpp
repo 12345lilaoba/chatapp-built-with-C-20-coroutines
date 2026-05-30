@@ -508,8 +508,25 @@ void test_throughput(const char* host, int port, int num_conns, int msgs_per_con
               << std::fixed << std::setprecision(2) << send_sec << "s" << std::endl;
     std::cout << "  等待接收完成..." << std::flush;
 
-    // 等接收线程再跑一会儿
-    usleep(1000000);
+    // 自适应等待接收完成。广播扇出量大时，固定等待 1s 会严重低估接收数。
+    const int max_wait_ms = 30000;
+    const int stall_limit_ms = 2000;
+    int waited_ms = 0;
+    int stall_ms = 0;
+    int64_t last_recv = total_recv.load(std::memory_order_relaxed);
+    while (total_recv.load(std::memory_order_relaxed) < expected_recv && waited_ms < max_wait_ms) {
+        usleep(10000);
+        waited_ms += 10;
+
+        int64_t cur_recv = total_recv.load(std::memory_order_relaxed);
+        if (cur_recv > last_recv) {
+            last_recv = cur_recv;
+            stall_ms = 0;
+        } else {
+            stall_ms += 10;
+            if (stall_ms >= stall_limit_ms) break;
+        }
+    }
     send_done.store(true);
     for (auto& r : receivers) r.join();
 

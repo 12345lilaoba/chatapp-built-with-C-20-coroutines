@@ -163,6 +163,43 @@ struct AppContext {
  * 内存管理：协程帧在协程结束时自动销毁（FireAndForget::promise_type 中的 final_suspend
  *           返回 std::suspend_never，协程完成后自动释放）。
  */
+
+// Minimal JSON string extractor for the flat client messages used by this app.
+inline std::string extract_json_field(const std::string& json, const std::string& field) {
+    std::string target = "\"" + field + "\":";
+    size_t pos = json.find(target);
+    if (pos == std::string::npos) {
+        target = "\"" + field + "\" :";
+        pos = json.find(target);
+        if (pos == std::string::npos) return "";
+    }
+    pos += target.size();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+    if (pos >= json.size() || json[pos] != '"') return "";
+    pos++;
+
+    std::string out;
+    while (pos < json.size()) {
+        char c = json[pos++];
+        if (c == '"') break;
+        if (c == '\\' && pos < json.size()) {
+            out += json[pos++];
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+inline std::string room_messages_key(const std::string& room_id) {
+    return "chatroom:" + room_id + ":messages";
+}
+
+inline std::string make_room_deleted_msg(const std::string& room_id) {
+    return "{\"action\":\"system\",\"type\":\"room_deleted\",\"room_id\":\""
+        + json_escape(room_id) + "\"}";
+}
+
 inline FireAndForget handle_http_connection(int client_fd, Worker* worker,
                                             WorkerRedis* redis,
                                             ThreadPool* thread_pool,
@@ -262,11 +299,33 @@ inline FireAndForget handle_http_connection(int client_fd, Worker* worker,
                     goto cleanup;
                 }
                 std::string ws_username = user_result->reply_str;
-                std::cerr << "[WS] fd=" << client_fd << " user=" << ws_username 
-                          << " handshake ok" << std::endl;
+                std::string current_room = req.params.count("room") ? req.params["room"] : "general";
+                if (current_room.empty()) current_room = "general";
 
-                // ----- 发送 WebSocket 101 握手响应 -----
-                // 按照 RFC 6455，服务端必须返回 101 状态码和计算好的 Accept 密钥
+                if (current_room != "general") {
+                    std::string esc_room = mysql_escape(current_room);
+                    std::string esc_user = mysql_escape(ws_username);
+                    auto member_check = co_await AsyncMySQLQuery(
+                        worker, thread_pool, mysql_pool,
+                        "SELECT r.room_id FROM rooms r "
+                        "JOIN room_members m ON r.room_id=m.room_id "
+                        "WHERE r.room_id='" + esc_room + "' AND m.username='" + esc_user + "' LIMIT 1");
+                    if (!member_check.success || member_check.rows.empty()) {
+                        HttpResponse resp = HttpResponse::error(403, "Forbidden");
+                        std::string data = resp.serialize();
+                        size_t off = 0;
+                        while (off < data.size()) {
+                            ssize_t wn = co_await AsyncWrite(client_fd, data.data() + off, data.size() - off);
+                            if (wn <= 0) break;
+                            off += (size_t)wn;
+                        }
+                        goto cleanup;
+                    }
+                }
+
+                std::cerr << "[WS] fd=" << client_fd << " user=" << ws_username
+                          << " room=" << current_room << " handshake ok" << std::endl;
+
                 std::string handshake =
                     "HTTP/1.1 101 Switching Protocols\r\n"
                     "Upgrade: websocket\r\n"
@@ -278,20 +337,17 @@ inline FireAndForget handle_http_connection(int client_fd, Worker* worker,
                     while (off < handshake.size()) {
                         ssize_t wn = co_await AsyncWrite(client_fd, handshake.data() + off, handshake.size() - off);
                         if (wn <= 0) goto cleanup;
-                        off += wn;
+                        off += (size_t)wn;
                     }
                 }
 
-                // 将此连接注册到全局 WebSocket 管理器（用于后续广播）
                 g_ws_manager.add(client_fd, worker, ws_username);
+                g_ws_manager.join_room(client_fd, current_room);
 
-                // ----- 发送历史消息 -----
-                // 新用户连接后，从 Redis 拉取最近 50 条消息推送给他
-                {
-                    auto msgs = co_await AsyncRedisCommand(redis, "LRANGE %s %s %s",
-                                                            "chatroom:messages", "-50", "-1");
+                auto send_history = [&](std::string room_id) -> FireAndForget {
+                    std::string key = room_messages_key(room_id);
+                    auto msgs = co_await AsyncRedisCommand(redis, "LRANGE %s %s %s", key.c_str(), "-50", "-1");
                     if (msgs->reply_type == REDIS_REPLY_ARRAY && !msgs->reply_str.empty()) {
-                        // 消息格式为 "用户名|时间|内容"，用 '|' 分隔
                         std::istringstream iss(msgs->reply_str);
                         std::string line;
                         while (std::getline(iss, line)) {
@@ -300,48 +356,33 @@ inline FireAndForget handle_http_connection(int client_fd, Worker* worker,
                             size_t p2 = line.find('|', p1 + 1);
                             if (p1 == std::string::npos || p2 == std::string::npos) continue;
                             std::string u = line.substr(0, p1);
-                            std::string t = line.substr(p1+1, p2-p1-1);
-                            std::string m = line.substr(p2+1);
-                            // 构造 JSON 并通过 WebSocket 帧发送
-                            std::string json_msg = "{\"user\":\"" + json_escape(u)
+                            std::string t = line.substr(p1 + 1, p2 - p1 - 1);
+                            std::string m = line.substr(p2 + 1);
+                            std::string json_msg = "{\"room_id\":\"" + json_escape(room_id)
+                                + "\",\"user\":\"" + json_escape(u)
                                 + "\",\"time\":\"" + json_escape(t)
                                 + "\",\"text\":\"" + json_escape(m) + "\"}";
                             std::string frame = ws_encode_frame(WS_TEXT, json_msg);
                             size_t off = 0;
                             while (off < frame.size()) {
                                 ssize_t wn = co_await AsyncWrite(client_fd, frame.data() + off, frame.size() - off);
-                                if (wn <= 0) goto ws_cleanup;
-                                off += wn;
+                                if (wn <= 0) co_return;
+                                off += (size_t)wn;
                             }
                         }
                     }
-                }
+                };
+                send_history(current_room);
 
-                // ========== WebSocket 消息循环 ==========
-                // 握手完成后，连接已从 HTTP 切换为 WebSocket 协议
-                // 此循环持续读取客户端发来的 WebSocket 帧，直到连接关闭
                 std::cerr << "[WS] fd=" << client_fd << " entering msg loop" << std::endl;
                 while (true) {
-                    // ----- 读取 WebSocket 帧头（2 字节）-----
-                    // 第 1 字节: FIN 位 + opcode（操作码）
-                    // 第 2 字节: MASK 位 + payload length（载荷长度）
                     uint8_t header[2];
                     {
                         ssize_t n;
-                        int retries = 0;
                         do {
                             n = co_await AsyncRead(client_fd, (char*)header, 2);
-                            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
-                                retries++;
-                                std::cerr << "[WS] fd=" << client_fd << " EAGAIN retry #" << retries << std::endl;
-                            }
                         } while (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR));
-                        if (n <= 0) {
-                            std::cerr << "[WS] fd=" << client_fd << " read header n=" << n 
-                                      << " errno=" << errno << " retries=" << retries << std::endl;
-                            break;
-                        }
-                        // 可能只读到 1 字节（TCP 分片），需要继续读第 2 字节
+                        if (n <= 0) break;
                         if (n == 1) {
                             ssize_t n2;
                             do {
@@ -351,15 +392,10 @@ inline FireAndForget handle_http_connection(int client_fd, Worker* worker,
                         }
                     }
 
-                    uint8_t opcode = header[0] & 0x0F;             // 低 4 位是操作码
-                    bool masked = (header[1] & 0x80) != 0;         // 最高位标识是否有掩码
-                    uint64_t payload_len = header[1] & 0x7F;       // 低 7 位是载荷长度（或长度类型标记）
+                    uint8_t opcode = header[0] & 0x0F;
+                    bool masked = (header[1] & 0x80) != 0;
+                    uint64_t payload_len = header[1] & 0x7F;
 
-                    // ----- 扩展长度字段处理 -----
-                    // WebSocket 帧的载荷长度编码：
-                    //   0-125:   直接使用 7 位值
-                    //   126:     后续 2 字节为实际长度（uint16_t，大端序）
-                    //   127:     后续 8 字节为实际长度（uint64_t，大端序）
                     if (payload_len == 126) {
                         uint8_t ext[2];
                         ssize_t n = co_await AsyncRead(client_fd, (char*)ext, 2);
@@ -370,66 +406,92 @@ inline FireAndForget handle_http_connection(int client_fd, Worker* worker,
                         ssize_t n = co_await AsyncRead(client_fd, (char*)ext, 8);
                         if (n <= 0) break;
                         payload_len = 0;
-                        for (int i = 0; i < 8; i++)
-                            payload_len = (payload_len << 8) | ext[i];
+                        for (int i = 0; i < 8; i++) payload_len = (payload_len << 8) | ext[i];
                     }
 
-                    // ----- 读取掩码密钥 -----
-                    // RFC 6455 规定客户端发送的帧必须使用掩码（4 字节密钥）
                     uint8_t mask_key[4] = {};
                     if (masked) {
                         ssize_t n = co_await AsyncRead(client_fd, (char*)mask_key, 4);
                         if (n <= 0) break;
                     }
 
-                    // ----- 读取载荷数据 -----
                     std::string payload(payload_len, '\0');
                     size_t read_off = 0;
                     while (read_off < payload_len) {
                         ssize_t n = co_await AsyncRead(client_fd, &payload[read_off], payload_len - read_off);
                         if (n <= 0) goto ws_cleanup;
-                        read_off += n;
+                        read_off += (size_t)n;
                     }
 
-                    // ----- 解除掩码 -----
-                    // 掩码算法：payload[i] XOR mask_key[i % 4]
                     if (masked) {
-                        for (size_t i = 0; i < payload.size(); i++)
-                            payload[i] ^= mask_key[i % 4];
+                        for (size_t i = 0; i < payload.size(); i++) payload[i] ^= mask_key[i % 4];
                     }
 
-                    // ----- 处理不同类型的帧 -----
-                    if (opcode == WS_CLOSE) break;      // 关闭帧：结束消息循环
-
+                    if (opcode == WS_CLOSE) break;
                     if (opcode == WS_PING) {
-                        // Ping 帧：必须回复 Pong 帧（载荷原样返回）
                         std::string pong = ws_encode_frame(WS_PONG, payload);
                         size_t off = 0;
                         while (off < pong.size()) {
                             ssize_t wn = co_await AsyncWrite(client_fd, pong.data() + off, pong.size() - off);
                             if (wn <= 0) goto ws_cleanup;
-                            off += wn;
+                            off += (size_t)wn;
                         }
                         continue;
                     }
 
                     if (opcode == WS_TEXT && !payload.empty()) {
-                        // 文本帧：客户端发来的聊天消息（纯文本内容）
-                        std::string time_str = current_time_str();
-                        // 消息持久化格式："用户名|时间|内容"
-                        std::string entry = ws_username + "|" + time_str + "|" + payload;
+                        std::string action = extract_json_field(payload, "action");
+                        std::string room_id = extract_json_field(payload, "room_id");
+                        if (room_id.empty()) room_id = current_room;
 
-                        // 存入 Redis list，保留最近 200 条
-                        co_await AsyncRedisCommand(redis, "RPUSH %s %s", "chatroom:messages", entry);
-                        co_await AsyncRedisCommand(redis, "LTRIM %s %s %s", "chatroom:messages", "-200", "-1");
+                        if (action == "join" && !room_id.empty()) {
+                            current_room = room_id;
+                            g_ws_manager.join_room(client_fd, room_id);
+                            send_history(room_id);
+                        } else if (action == "leave" && !room_id.empty()) {
+                            g_ws_manager.leave_room(client_fd, room_id);
+                        } else {
+                            std::string text = action == "send" ? extract_json_field(payload, "text") : payload;
+                            if (text.empty()) continue;
 
-                        // 构造 JSON 并广播给所有在线的 WebSocket 客户端
-                        std::string json_msg = "{\"user\":\"" + json_escape(ws_username)
-                            + "\",\"time\":\"" + json_escape(time_str)
-                            + "\",\"text\":\"" + json_escape(payload) + "\"}";
-                        g_ws_manager.broadcast(json_msg);
+                            if (room_id != "general") {
+                                std::string esc_room = mysql_escape(room_id);
+                                std::string esc_user = mysql_escape(ws_username);
+                                auto member_check = co_await AsyncMySQLQuery(
+                                    worker, thread_pool, mysql_pool,
+                                    "SELECT r.room_id FROM rooms r "
+                                    "JOIN room_members m ON r.room_id=m.room_id "
+                                    "WHERE r.room_id='" + esc_room + "' AND m.username='" + esc_user + "' LIMIT 1");
+                                if (!member_check.success || member_check.rows.empty()) {
+                                    g_ws_manager.leave_room(client_fd, room_id);
+                                    std::string sys_msg = "{\"action\":\"system\",\"type\":\"room_missing\",\"room_id\":\""
+                                        + json_escape(room_id) + "\",\"message\":\"群不存在或你已不在该群，已自动退出。\"}";
+                                    std::string frame = ws_encode_frame(WS_TEXT, sys_msg);
+                                    size_t off = 0;
+                                    while (off < frame.size()) {
+                                        ssize_t wn = co_await AsyncWrite(client_fd, frame.data() + off, frame.size() - off);
+                                        if (wn <= 0) goto ws_cleanup;
+                                        off += (size_t)wn;
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            std::string time_str = current_time_str();
+                            std::string entry = ws_username + "|" + time_str + "|" + text;
+                            std::string redis_key = room_messages_key(room_id);
+                            co_await AsyncRedisCommand(redis, "RPUSH %s %s", redis_key.c_str(), entry);
+                            co_await AsyncRedisCommand(redis, "LTRIM %s %s %s", redis_key.c_str(), "-200", "-1");
+
+                            std::string json_msg = "{\"room_id\":\"" + json_escape(room_id)
+                                + "\",\"user\":\"" + json_escape(ws_username)
+                                + "\",\"time\":\"" + json_escape(time_str)
+                                + "\",\"text\":\"" + json_escape(text) + "\"}";
+                            g_ws_manager.broadcast_to_room(room_id, json_msg);
+                        }
                     }
                 }
+
 
             ws_cleanup:
                 std::cerr << "[WS] fd=" << client_fd << " user=" << ws_username 
@@ -516,6 +578,147 @@ inline FireAndForget handle_http_connection(int client_fd, Worker* worker,
                         resp = HttpResponse::json("{\"token\":\"" + tok + "\",\"message\":\"登录成功\"}");
                     } else {
                         resp = HttpResponse::error(401, "用户名或密码错误");
+                    }
+                }
+            }
+
+            // --- GET /api/rooms : 获取房间列表和当前用户加入状态 ---
+            else if (req.method == "GET" && req.path == "/api/rooms") {
+                std::string tok = req.params.count("token") ? req.params["token"] : "";
+                std::string username;
+                if (!tok.empty()) {
+                    auto user_result = co_await AsyncRedisCommand(redis, "GET %s", "token:" + tok);
+                    if (user_result->reply_type == REDIS_REPLY_STRING) username = user_result->reply_str;
+                }
+
+                std::string sql =
+                    "SELECT r.room_id, r.name, r.description, r.owner_username, "
+                    "IF(m.username IS NOT NULL, 1, 0) "
+                    "FROM rooms r LEFT JOIN room_members m "
+                    "ON r.room_id=m.room_id AND m.username='" + mysql_escape(username) + "' "
+                    "ORDER BY r.created_at ASC";
+                auto result = co_await AsyncMySQLQuery(worker, thread_pool, mysql_pool, sql);
+                if (!result.success) {
+                    resp = HttpResponse::error(500, "Database error");
+                } else {
+                    std::string json = "{\"rooms\":[";
+                    for (size_t i = 0; i < result.rows.size(); ++i) {
+                        if (i) json += ",";
+                        json += "{\"id\":\"" + json_escape(result.rows[i][0]) + "\",";
+                        json += "\"name\":\"" + json_escape(result.rows[i][1]) + "\",";
+                        json += "\"description\":\"" + json_escape(result.rows[i][2]) + "\",";
+                        json += "\"owner\":\"" + json_escape(result.rows[i][3]) + "\",";
+                        json += "\"joined\":" + (result.rows[i][4] == "1" || result.rows[i][0] == "general" ? std::string("true") : std::string("false")) + "}";
+                    }
+                    json += "]}";
+                    resp = HttpResponse::json(json);
+                }
+            }
+            // --- POST /api/room/create : 创建房间 ---
+            else if (req.method == "POST" && req.path == "/api/room/create") {
+                std::string tok = req.json_get("token");
+                std::string room_id = req.json_get("room_id");
+                std::string name = req.json_get("name");
+                std::string desc = req.json_get("description");
+                if (tok.empty() || room_id.empty() || name.empty()) {
+                    resp = HttpResponse::error(400, "缺少参数");
+                } else {
+                    auto user_result = co_await AsyncRedisCommand(redis, "GET %s", "token:" + tok);
+                    if (user_result->reply_type != REDIS_REPLY_STRING || user_result->reply_str.empty()) {
+                        resp = HttpResponse::error(401, "未登录");
+                    } else {
+                        std::string username = user_result->reply_str;
+                        std::string esc_id = mysql_escape(room_id);
+                        std::string esc_user = mysql_escape(username);
+                        auto result = co_await AsyncMySQLQuery(
+                            worker, thread_pool, mysql_pool,
+                            "INSERT INTO rooms(room_id,name,description,owner_username) VALUES('"
+                            + esc_id + "','" + mysql_escape(name) + "','" + mysql_escape(desc) + "','" + esc_user + "')");
+                        if (!result.success) {
+                            resp = HttpResponse::error(409, "房间已存在或创建失败");
+                        } else {
+                            co_await AsyncMySQLQuery(worker, thread_pool, mysql_pool,
+                                "INSERT IGNORE INTO room_members(room_id,username) VALUES('" + esc_id + "','" + esc_user + "')");
+                            resp = HttpResponse::json("{\"message\":\"房间创建成功\"}");
+                        }
+                    }
+                }
+            }
+            // --- POST /api/room/join : 加入房间 ---
+            else if (req.method == "POST" && req.path == "/api/room/join") {
+                std::string tok = req.json_get("token");
+                std::string room_id = req.json_get("room_id");
+                if (tok.empty() || room_id.empty()) {
+                    resp = HttpResponse::error(400, "缺少参数");
+                } else {
+                    auto user_result = co_await AsyncRedisCommand(redis, "GET %s", "token:" + tok);
+                    if (user_result->reply_type != REDIS_REPLY_STRING || user_result->reply_str.empty()) {
+                        resp = HttpResponse::error(401, "未登录");
+                    } else {
+                        std::string esc_id = mysql_escape(room_id);
+                        std::string esc_user = mysql_escape(user_result->reply_str);
+                        auto exists = co_await AsyncMySQLQuery(worker, thread_pool, mysql_pool,
+                            "SELECT room_id FROM rooms WHERE room_id='" + esc_id + "' LIMIT 1");
+                        if (!exists.success || exists.rows.empty()) {
+                            resp = HttpResponse::error(404, "房间不存在");
+                        } else {
+                            co_await AsyncMySQLQuery(worker, thread_pool, mysql_pool,
+                                "INSERT IGNORE INTO room_members(room_id,username) VALUES('" + esc_id + "','" + esc_user + "')");
+                            resp = HttpResponse::json("{\"message\":\"加入成功\"}");
+                        }
+                    }
+                }
+            }
+            // --- POST /api/room/leave : 退出房间 ---
+            else if (req.method == "POST" && req.path == "/api/room/leave") {
+                std::string tok = req.json_get("token");
+                std::string room_id = req.json_get("room_id");
+                if (tok.empty() || room_id.empty()) {
+                    resp = HttpResponse::error(400, "缺少参数");
+                } else if (room_id == "general") {
+                    resp = HttpResponse::error(403, "不能退出 general 房间");
+                } else {
+                    auto user_result = co_await AsyncRedisCommand(redis, "GET %s", "token:" + tok);
+                    if (user_result->reply_type != REDIS_REPLY_STRING || user_result->reply_str.empty()) {
+                        resp = HttpResponse::error(401, "未登录");
+                    } else {
+                        co_await AsyncMySQLQuery(worker, thread_pool, mysql_pool,
+                            "DELETE FROM room_members WHERE room_id='" + mysql_escape(room_id)
+                            + "' AND username='" + mysql_escape(user_result->reply_str) + "'");
+                        resp = HttpResponse::json("{\"message\":\"退出成功\"}");
+                    }
+                }
+            }
+            // --- POST /api/room/delete : 删除房间，仅 owner 可删 ---
+            else if (req.method == "POST" && req.path == "/api/room/delete") {
+                std::string tok = req.json_get("token");
+                std::string room_id = req.json_get("room_id");
+                if (tok.empty() || room_id.empty()) {
+                    resp = HttpResponse::error(400, "缺少参数");
+                } else if (room_id == "general") {
+                    resp = HttpResponse::error(403, "不能删除 general 房间");
+                } else {
+                    auto user_result = co_await AsyncRedisCommand(redis, "GET %s", "token:" + tok);
+                    if (user_result->reply_type != REDIS_REPLY_STRING || user_result->reply_str.empty()) {
+                        resp = HttpResponse::error(401, "未登录");
+                    } else {
+                        std::string esc_id = mysql_escape(room_id);
+                        auto owner = co_await AsyncMySQLQuery(worker, thread_pool, mysql_pool,
+                            "SELECT owner_username FROM rooms WHERE room_id='" + esc_id + "' LIMIT 1");
+                        if (!owner.success || owner.rows.empty()) {
+                            resp = HttpResponse::error(404, "房间不存在");
+                        } else if (owner.rows[0][0] != user_result->reply_str) {
+                            resp = HttpResponse::error(403, "无权删除");
+                        } else {
+                            co_await AsyncMySQLQuery(worker, thread_pool, mysql_pool,
+                                "DELETE FROM room_members WHERE room_id='" + esc_id + "'");
+                            co_await AsyncMySQLQuery(worker, thread_pool, mysql_pool,
+                                "DELETE FROM rooms WHERE room_id='" + esc_id + "'");
+                            co_await AsyncRedisCommand(redis, "DEL %s", room_messages_key(room_id));
+                            g_ws_manager.broadcast_to_room(room_id, make_room_deleted_msg(room_id));
+                            g_ws_manager.evict_room(room_id);
+                            resp = HttpResponse::json("{\"message\":\"删除成功\"}");
+                        }
                     }
                 }
             }

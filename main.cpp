@@ -126,6 +126,43 @@ void init_mysql_tables(MySQLPool* pool) {
         // 执行成功，输出成功信息
         std::cout << "[Init] MySQL table 'users' ready" << std::endl;
     }
+
+    const char* create_rooms_table =
+        "CREATE TABLE IF NOT EXISTS rooms ("
+        "  id BIGINT AUTO_INCREMENT PRIMARY KEY,"
+        "  room_id VARCHAR(64) NOT NULL UNIQUE,"
+        "  name VARCHAR(64) NOT NULL,"
+        "  description VARCHAR(255) DEFAULT '',"
+        "  owner_username VARCHAR(64) NOT NULL DEFAULT '',"
+        "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+
+    if (mysql_real_query(conn, create_rooms_table, strlen(create_rooms_table)) != 0) {
+        std::cerr << "[Init] Create table rooms failed: " << mysql_error(conn) << std::endl;
+    } else {
+        std::cout << "[Init] MySQL table 'rooms' ready" << std::endl;
+    }
+
+    const char* create_room_members_table =
+        "CREATE TABLE IF NOT EXISTS room_members ("
+        "  room_id VARCHAR(64) NOT NULL,"
+        "  username VARCHAR(64) NOT NULL,"
+        "  joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+        "  PRIMARY KEY(room_id, username)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+
+    if (mysql_real_query(conn, create_room_members_table, strlen(create_room_members_table)) != 0) {
+        std::cerr << "[Init] Create table room_members failed: " << mysql_error(conn) << std::endl;
+    } else {
+        std::cout << "[Init] MySQL table 'room_members' ready" << std::endl;
+    }
+
+    const char* insert_default_room =
+        "INSERT IGNORE INTO rooms (room_id, name, description, owner_username) "
+        "VALUES ('general', 'General Chat', 'Welcome to the chatroom', '')";
+    if (mysql_real_query(conn, insert_default_room, strlen(insert_default_room)) != 0) {
+        std::cerr << "[Init] Insert default room failed: " << mysql_error(conn) << std::endl;
+    }
     
     // 将连接归还到连接池，供其他请求使用
     pool->release(conn);

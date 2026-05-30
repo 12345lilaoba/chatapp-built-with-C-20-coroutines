@@ -16,3 +16,6 @@ bench_layers
 *.tmp
 *.log
 testoo.txt
+
+# 本地压测配置/密码
+.bench_env

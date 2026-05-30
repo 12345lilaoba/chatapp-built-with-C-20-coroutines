@@ -16,6 +16,9 @@
 #include <mutex>
 #include <functional>
 #include <cstring>
+#include <queue>
+#include <atomic>
+#include <iostream>
 
 // ==================== SHA1 + Base64（WebSocket 握手用）====================
 
@@ -172,52 +175,182 @@ struct WSClient {
     int fd;
     Worker* worker;
     std::string username;
+    std::queue<std::string> send_queue;
+    bool is_writing = false;
+    std::set<std::string> joined_rooms;
 };
+
+inline thread_local std::map<int, WSClient> t_local_clients;
+inline thread_local std::map<std::string, std::set<int>> t_local_rooms;
+inline std::atomic<int> g_online_count{0};
+
+inline FireAndForget client_write_loop(int fd) {
+    while (true) {
+        std::string frame;
+        {
+            auto it = t_local_clients.find(fd);
+            if (it == t_local_clients.end()) co_return;
+
+            auto& client = it->second;
+            if (client.send_queue.empty()) {
+                client.is_writing = false;
+                co_return;
+            }
+            frame = std::move(client.send_queue.front());
+            client.send_queue.pop();
+        }
+
+        size_t off = 0;
+        while (off < frame.size()) {
+            ssize_t wn = co_await AsyncWrite(fd, frame.data() + off, frame.size() - off);
+            if (wn <= 0) {
+                auto it = t_local_clients.find(fd);
+                if (it != t_local_clients.end()) {
+                    for (const auto& room_id : it->second.joined_rooms) {
+                        t_local_rooms[room_id].erase(fd);
+                    }
+                    t_local_clients.erase(it);
+                    g_online_count--;
+                }
+                ::shutdown(fd, SHUT_RDWR);
+                co_return;
+            }
+            off += (size_t)wn;
+        }
+    }
+}
+
+inline void enqueue_or_write_frame(int fd, const std::string& frame) {
+    auto it = t_local_clients.find(fd);
+    if (it == t_local_clients.end()) return;
+    auto& client = it->second;
+
+    if (client.is_writing) {
+        client.send_queue.push(frame);
+        return;
+    }
+
+    ssize_t n = ::write(fd, frame.data(), frame.size());
+    if (n == (ssize_t)frame.size()) return;
+
+    if (n > 0) {
+        client.send_queue.push(frame.substr((size_t)n));
+    } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        client.send_queue.push(frame);
+    } else {
+        for (const auto& room_id : client.joined_rooms) {
+            t_local_rooms[room_id].erase(fd);
+        }
+        t_local_clients.erase(it);
+        g_online_count--;
+        ::shutdown(fd, SHUT_RDWR);
+        return;
+    }
+
+    client.is_writing = true;
+    client_write_loop(fd);
+}
+
+inline void broadcast_to_local_room(const std::string& room_id, const std::string& frame) {
+    auto room_it = t_local_rooms.find(room_id);
+    if (room_it == t_local_rooms.end()) return;
+
+    std::vector<int> fds(room_it->second.begin(), room_it->second.end());
+    for (int fd : fds) enqueue_or_write_frame(fd, frame);
+}
+
+inline void broadcast_to_local_clients(const std::string& frame) {
+    std::vector<int> fds;
+    fds.reserve(t_local_clients.size());
+    for (const auto& [fd, _] : t_local_clients) fds.push_back(fd);
+    for (int fd : fds) enqueue_or_write_frame(fd, frame);
+}
+
+inline FireAndForget local_broadcast_room(Worker* target_worker, std::string room_id, std::string frame) {
+    co_await SwitchToWorker{target_worker};
+    broadcast_to_local_room(room_id, frame);
+}
+
+inline FireAndForget local_broadcast_all(Worker* target_worker, std::string frame) {
+    co_await SwitchToWorker{target_worker};
+    broadcast_to_local_clients(frame);
+}
+
+inline void evict_local_room(const std::string& room_id) {
+    auto room_it = t_local_rooms.find(room_id);
+    if (room_it == t_local_rooms.end()) return;
+
+    for (int fd : room_it->second) {
+        auto client_it = t_local_clients.find(fd);
+        if (client_it != t_local_clients.end()) {
+            client_it->second.joined_rooms.erase(room_id);
+        }
+    }
+    t_local_rooms.erase(room_it);
+}
+
+inline FireAndForget local_evict_room(Worker* target_worker, std::string room_id) {
+    co_await SwitchToWorker{target_worker};
+    evict_local_room(room_id);
+}
 
 class WSManager {
 public:
     void add(int fd, Worker* worker, const std::string& username) {
-        std::lock_guard<std::mutex> lock(mu_);
-        clients_[fd] = {fd, worker, username};
+        t_local_clients[fd] = WSClient{fd, worker, username, {}, false, {}};
+        g_online_count++;
     }
 
     void remove(int fd) {
-        std::lock_guard<std::mutex> lock(mu_);
-        clients_.erase(fd);
+        auto it = t_local_clients.find(fd);
+        if (it == t_local_clients.end()) return;
+        for (const auto& room_id : it->second.joined_rooms) {
+            t_local_rooms[room_id].erase(fd);
+        }
+        t_local_clients.erase(it);
+        g_online_count--;
     }
 
-    // 广播消息给所有在线客户端
-    // WebSocket 帧通常 < 1KB，非阻塞 fd 上同步写入基本不会阻塞
+    void join_room(int fd, const std::string& room_id) {
+        auto it = t_local_clients.find(fd);
+        if (it == t_local_clients.end()) return;
+        it->second.joined_rooms.insert(room_id);
+        t_local_rooms[room_id].insert(fd);
+    }
+
+    void leave_room(int fd, const std::string& room_id) {
+        auto it = t_local_clients.find(fd);
+        if (it == t_local_clients.end()) return;
+        it->second.joined_rooms.erase(room_id);
+        t_local_rooms[room_id].erase(fd);
+    }
+
     void broadcast(const std::string& message) {
         std::string frame = ws_encode_frame(WS_TEXT, message);
-        // 把 JSON 消息编码成 WebSocket 文本帧。
-        std::lock_guard<std::mutex> lock(mu_);
-        /*
-            循环写，直到这个客户端写完，或者写失败。
-            这里没有用 AsyncWrite，而是直接同步 write。因为注释里假设 WebSocket 消息通常小于 1KB，非阻塞 socket 上一般不会阻塞太久。
-            但要注意：这是演示级实现。如果客户端很多或者某些客户端很慢，这里可能出现：
-                1、写不完整
-                2、写失败后消息丢失
-                3、持锁期间做 IO，影响其他 add/remove/broadcast
-        */
-        for (auto& [fd, client] : clients_) {
-            size_t off = 0;
-            while (off < frame.size()) {
-                ssize_t n = ::write(fd, frame.data() + off, frame.size() - off);
-                if (n <= 0) break;
-                off += n;
-            }
+        for (auto& w : g_workers) {
+            if (w.get() == t_worker) broadcast_to_local_clients(frame);
+            else local_broadcast_all(w.get(), frame);
+        }
+    }
+
+    void broadcast_to_room(const std::string& room_id, const std::string& message) {
+        std::string frame = ws_encode_frame(WS_TEXT, message);
+        for (auto& w : g_workers) {
+            if (w.get() == t_worker) broadcast_to_local_room(room_id, frame);
+            else local_broadcast_room(w.get(), room_id, frame);
         }
     }
 
     int online_count() {
-        std::lock_guard<std::mutex> lock(mu_);
-        return (int)clients_.size();
+        return g_online_count.load();
     }
 
-private:
-    std::map<int, WSClient> clients_;
-    std::mutex mu_;
+    void evict_room(const std::string& room_id) {
+        for (auto& w : g_workers) {
+            if (w.get() == t_worker) evict_local_room(room_id);
+            else local_evict_room(w.get(), room_id);
+        }
+    }
 };
 
 // 全局 WebSocket 管理器
